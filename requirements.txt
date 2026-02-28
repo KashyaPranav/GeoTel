@@ -1,0 +1,10 @@
+streamlit
+numpy
+matplotlib
+streamlit-image-comparison
+pandas
+pillow
+earthengine-api
+geemap
+plotly
+geopy
