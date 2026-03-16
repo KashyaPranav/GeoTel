@@ -96,6 +96,22 @@ def compute_statistics(baseline_arr, current_arr, index_key):
     mean_c = float(np.nanmean(current_arr))
     mean_delta = float(np.nanmean(delta))
 
+    std_b = float(np.nanstd(baseline_arr))
+    std_c = float(np.nanstd(current_arr))
+    median_b = float(np.nanmedian(baseline_arr))
+    median_c = float(np.nanmedian(current_arr))
+    min_b = float(np.nanmin(baseline_arr))
+    min_c = float(np.nanmin(current_arr))
+    max_b = float(np.nanmax(baseline_arr))
+    max_c = float(np.nanmax(current_arr))
+
+    # Coefficient of variation (CV = std / |mean|)
+    cv_b = (std_b / abs(mean_b) * 100.0) if abs(mean_b) > EPS else 0.0
+    cv_c = (std_c / abs(mean_c) * 100.0) if abs(mean_c) > EPS else 0.0
+
+    # Root mean square of the change field
+    rms_change = float(np.sqrt(np.nanmean(delta ** 2)))
+
     # percentage change of the mean values
     if abs(mean_b) > EPS:
         pct_of_mean = (mean_c - mean_b) / mean_b * 100.0
@@ -116,9 +132,18 @@ def compute_statistics(baseline_arr, current_arr, index_key):
     return {
         "mean_baseline": mean_b,
         "mean_current": mean_c,
-        "std_baseline": float(np.nanstd(baseline_arr)),
-        "std_current": float(np.nanstd(current_arr)),
+        "std_baseline": std_b,
+        "std_current": std_c,
+        "median_baseline": median_b,
+        "median_current": median_c,
+        "min_baseline": min_b,
+        "min_current": min_c,
+        "max_baseline": max_b,
+        "max_current": max_c,
+        "cv_baseline": cv_b,
+        "cv_current": cv_c,
         "mean_change": mean_delta,
+        "rms_change": rms_change,
         "pct_change": pct_of_mean,
         "spatial_distribution": spatial,
         "interpretation": interpretation,
@@ -181,10 +206,11 @@ def multi_location_summary(all_results):
                 {
                     "Location": loc,
                     "Index": INTERPRETATIONS[idx_key]["name"],
-                    "Mean Baseline": round(s["mean_baseline"], 4),
-                    "Mean Current": round(s["mean_current"], 4),
-                    "Mean Change": round(s["mean_change"], 4),
+                    "Mean Baseline": round(s["mean_baseline"], 6),
+                    "Mean Current": round(s["mean_current"], 6),
+                    "Mean Change": round(s["mean_change"], 6),
                     "% Change": round(s["pct_change"], 2),
+                    "RMS Change": round(s["rms_change"], 6),
                     "Pixels Increased (%)": round(s["spatial_distribution"]["positive_frac"] * 100, 1),
                     "Pixels Decreased (%)": round(s["spatial_distribution"]["negative_frac"] * 100, 1),
                     "Interpretation": s["interpretation"],

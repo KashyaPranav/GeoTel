@@ -347,7 +347,7 @@ if search_clicked:
         # Ensure matching spatial dimensions
         min_h = min(data_b["blue"].shape[0], data_c["blue"].shape[0])
         min_w = min(data_b["blue"].shape[1], data_c["blue"].shape[1])
-        for k in ("blue", "green", "red", "nir"):
+        for k in ("blue", "green", "red", "nir", "swir"):
             data_b[k] = data_b[k][:min_h, :min_w]
             data_c[k] = data_c[k][:min_h, :min_w]
 
@@ -388,21 +388,38 @@ if stored_mode == "Multi-Location Comparison":
 
     rows = multi_location_summary(all_results)
     df = pd.DataFrame(rows)
+
+    def _color_change(row):
+        """Apply red/green to Mean Change based on index type."""
+        val = row["Mean Change"]
+        idx = row["Index"]
+        if not isinstance(val, (int, float)):
+            return ""
+        # NDVI: increase is good (green), decrease is bad (red)
+        # SI & NDBI: increase is bad (red), decrease is good (green)
+        if idx == "Vegetation Index (NDVI)":
+            return "color: green" if val > 0 else ("color: red" if val < 0 else "")
+        else:
+            return "color: red" if val > 0 else ("color: green" if val < 0 else "")
+
     st.dataframe(
         df.style.format(
             {
-                "Mean Baseline": "{:.4f}",
-                "Mean Current": "{:.4f}",
-                "Mean Change": "{:+.4f}",
+                "Mean Baseline": "{:.6f}",
+                "Mean Current": "{:.6f}",
+                "Mean Change": "{:+.6f}",
                 "% Change": "{:+.2f}",
+                "RMS Change": "{:.6f}",
                 "Pixels Increased (%)": "{:.1f}",
                 "Pixels Decreased (%)": "{:.1f}",
             }
-        ).map(
-            lambda v: "color: red" if isinstance(v, (int, float)) and v > 0 else (
-                "color: green" if isinstance(v, (int, float)) and v < 0 else ""
-            ),
-            subset=["Mean Change"],
+        ).apply(
+            lambda row: [""] * len(row) if "Mean Change" not in row.index
+            else [
+                _color_change(row) if col == "Mean Change" or col == "% Change" else ""
+                for col in row.index
+            ],
+            axis=1,
         ),
         use_container_width=True,
         height=min(35 * len(rows) + 38, 600),
@@ -450,8 +467,8 @@ else:
         with cols[i]:
             label = INDEX_LABELS[idx_key]
             delta_str = f"{s['pct_change']:+.2f}%"
-            delta_color = "inverse" if idx_key == "si" else ("normal" if idx_key == "ndvi" else "off")
-            st.metric(label, f"{s['mean_current']:.4f}", delta=delta_str, delta_color=delta_color)
+            delta_color = "inverse" if idx_key in ("si", "ndbi") else "normal"
+            st.metric(label, f"{s['mean_current']:.6f}", delta=delta_str, delta_color=delta_color)
 
     st.markdown("---")
 
@@ -467,7 +484,7 @@ else:
             formulas = {
                 "si": "SI = sqrt(Blue x Red)",
                 "ndvi": "NDVI = (NIR - Red) / (NIR + Red)",
-                "ndbi": "NDBI = (Red - NIR) / (Red + NIR)",
+                "ndbi": "NDBI = (SWIR1 - NIR) / (SWIR1 + NIR)",
             }
             st.markdown(f"**Formula**: `{formulas[idx_key]}`")
 
@@ -494,20 +511,35 @@ else:
 
             # Row 2: Statistics
             st.subheader("Statistical Aggregation")
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             with m1:
-                st.metric("Mean Baseline", f"{s['mean_baseline']:.4f}")
-                st.metric("Std Baseline", f"{s['std_baseline']:.4f}")
+                st.markdown("**Baseline**")
+                st.metric("Mean", f"{s['mean_baseline']:.6f}")
+                st.metric("Median", f"{s['median_baseline']:.6f}")
+                st.metric("Std Dev", f"{s['std_baseline']:.6f}")
             with m2:
-                st.metric("Mean Current", f"{s['mean_current']:.4f}")
-                st.metric("Std Current", f"{s['std_current']:.4f}")
+                st.markdown("**Current**")
+                st.metric("Mean", f"{s['mean_current']:.6f}")
+                st.metric("Median", f"{s['median_current']:.6f}")
+                st.metric("Std Dev", f"{s['std_current']:.6f}")
             with m3:
-                st.metric("Mean Change (Delta I)", f"{s['mean_change']:+.4f}")
-                st.metric("% Change", f"{s['pct_change']:+.2f}%")
+                st.markdown("**Range**")
+                st.metric("Min (Baseline)", f"{s['min_baseline']:.6f}")
+                st.metric("Max (Baseline)", f"{s['max_baseline']:.6f}")
+                st.metric("Min (Current)", f"{s['min_current']:.6f}")
+                st.metric("Max (Current)", f"{s['max_current']:.6f}")
             with m4:
+                st.markdown("**Change**")
+                st.metric("Mean Delta I", f"{s['mean_change']:+.6f}")
+                st.metric("RMS Change", f"{s['rms_change']:.6f}")
+                st.metric("% Change", f"{s['pct_change']:+.2f}%")
+            with m5:
+                st.markdown("**Spatial**")
                 sd = s["spatial_distribution"]
                 st.metric("Pixels Increased", f"{sd['positive_frac']*100:.1f}%")
                 st.metric("Pixels Decreased", f"{sd['negative_frac']*100:.1f}%")
+                st.metric("CV Baseline", f"{s['cv_baseline']:.1f}%")
+                st.metric("CV Current", f"{s['cv_current']:.1f}%")
 
             # Row 3: Histogram
             st.plotly_chart(
@@ -535,10 +567,19 @@ else:
         s = result[idx_key]["stats"]
         with summary_cols[i]:
             st.subheader(INDEX_LABELS[idx_key])
-            direction = "INCREASED" if s["mean_change"] > 0 else ("DECREASED" if s["mean_change"] < 0 else "STABLE")
+            if s["mean_change"] > 0:
+                direction = "INCREASED"
+                # SI/NDBI increase is bad (red), NDVI increase is good (green)
+                color = "red" if idx_key in ("si", "ndbi") else "green"
+            elif s["mean_change"] < 0:
+                direction = "DECREASED"
+                color = "green" if idx_key in ("si", "ndbi") else "red"
+            else:
+                direction = "STABLE"
+                color = "gray"
             st.markdown(
-                f"**Trend**: {direction}  \n"
-                f"**Delta I**: `{s['mean_change']:+.4f}`  \n"
+                f"**Trend**: :{color}[**{direction}**]  \n"
+                f"**Delta I**: `{s['mean_change']:+.6f}`  \n"
                 f"**% Change**: `{s['pct_change']:+.2f}%`  \n"
                 f"**Interpretation**: {s['interpretation']}"
             )

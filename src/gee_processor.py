@@ -117,7 +117,7 @@ def fetch_sentinel_data(location_name=None, year=2024, month=1, month_end=12,
         .filterBounds(region)
         .filterDate(start_date, end_date)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
-        .select(["B2", "B3", "B4", "B8", "SCL"])
+        .select(["B2", "B3", "B4", "B8", "B11", "SCL"])
     )
 
     count = collection.size().getInfo()
@@ -128,7 +128,7 @@ def fetch_sentinel_data(location_name=None, year=2024, month=1, month_end=12,
     composite = (
         collection.map(_cloud_mask_s2)
         .median()
-        .select(["B2", "B3", "B4", "B8"])
+        .select(["B2", "B3", "B4", "B8", "B11"])
     )
 
     # Reproject to a fixed CRS and scale so sampleRectangle returns a
@@ -146,6 +146,7 @@ def fetch_sentinel_data(location_name=None, year=2024, month=1, month_end=12,
     green = np.array(band_data.get("B3").getInfo(), dtype=np.float64) / 10000.0
     red = np.array(band_data.get("B4").getInfo(), dtype=np.float64) / 10000.0
     nir = np.array(band_data.get("B8").getInfo(), dtype=np.float64) / 10000.0
+    swir = np.array(band_data.get("B11").getInfo(), dtype=np.float64) / 10000.0
 
     # Validate we got a meaningful raster
     if blue.size <= 1:
@@ -156,6 +157,7 @@ def fetch_sentinel_data(location_name=None, year=2024, month=1, month_end=12,
         "green": green,
         "red": red,
         "nir": nir,
+        "swir": swir,
         "source": "Google Earth Engine",
         "count": count,
     }
@@ -176,6 +178,7 @@ def generate_synthetic_data(location_name, year):
     green = rng.uniform(0.08, 0.18, shape)
     red = rng.uniform(0.08, 0.20, shape)
     nir = rng.uniform(0.20, 0.40, shape)
+    swir = rng.uniform(0.15, 0.30, shape)
 
     # Spatial gradient: left side more marine-influenced
     x_grad = np.broadcast_to(np.linspace(0, 1, shape[1])[None, :], shape)
@@ -186,6 +189,7 @@ def generate_synthetic_data(location_name, year):
     green[water] = rng.uniform(0.04, 0.08, water.sum())
     red[water] = rng.uniform(0.02, 0.05, water.sum())
     nir[water] = rng.uniform(0.01, 0.04, water.sum())
+    swir[water] = rng.uniform(0.005, 0.03, water.sum())
 
     # Dense vegetation (right / inland)
     veg = x_grad > 0.7
@@ -193,6 +197,7 @@ def generate_synthetic_data(location_name, year):
     green[veg] = rng.uniform(0.06, 0.12, veg.sum())
     red[veg] = rng.uniform(0.03, 0.06, veg.sum())
     nir[veg] = rng.uniform(0.30, 0.55, veg.sum())
+    swir[veg] = rng.uniform(0.08, 0.15, veg.sum())
 
     # Urban patch (center)
     urban = (x_grad > 0.35) & (x_grad < 0.55)
@@ -200,30 +205,35 @@ def generate_synthetic_data(location_name, year):
     green[urban] = rng.uniform(0.10, 0.16, urban.sum())
     red[urban] = rng.uniform(0.12, 0.22, urban.sum())
     nir[urban] = rng.uniform(0.15, 0.25, urban.sum())
+    swir[urban] = rng.uniform(0.20, 0.35, urban.sum())
 
     # Temporal drift: salinity increases, vegetation degrades, buildup expands
     drift = (year - 2015) * 0.003
     blue += drift * 0.5
     red += drift * 0.8
     nir -= drift * 0.3  # vegetation stress
+    swir += drift * 0.4  # built-up surfaces reflect more SWIR
 
     # Expand urban zone slightly each year
     urban_expand = (year - 2015) * 0.005
     expanding = (x_grad > (0.55 - urban_expand)) & (x_grad < (0.55 + urban_expand))
     red[expanding] += 0.02
     nir[expanding] -= 0.02
+    swir[expanding] += 0.03  # new built-up reflects SWIR
 
     # Clip to physical bounds
     blue = np.clip(blue, 0, 1)
     green = np.clip(green, 0, 1)
     red = np.clip(red, 0, 1)
     nir = np.clip(nir, 0, 1)
+    swir = np.clip(swir, 0, 1)
 
     return {
         "blue": blue,
         "green": green,
         "red": red,
         "nir": nir,
+        "swir": swir,
         "source": "Synthetic (Demo)",
         "count": 0,
     }
