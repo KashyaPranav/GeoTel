@@ -450,7 +450,7 @@ def _generate_pdf_report(loc, result, baseline_year, current_year, bounds=None):
     pdf.set_font("Helvetica", "I", 9)
     pdf.cell(0, 5, "Data: ESA Copernicus Sentinel-2 L2A | Framework: GeoSpace", ln=True)
 
-    return pdf.output()
+    return bytes(pdf.output())
 
 
 def _generate_geotiff_bytes(arr, bounds, band_name="index"):
