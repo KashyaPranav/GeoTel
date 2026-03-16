@@ -15,6 +15,9 @@ Pipeline:
 
 import sys
 import os
+import io
+import json
+import tempfile
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -23,6 +26,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import folium
+from streamlit_folium import st_folium
+from scipy import stats as scipy_stats
 from datetime import datetime
 from geopy.geocoders import Nominatim
 
@@ -32,6 +38,7 @@ from src.gee_processor import (
     generate_synthetic_data,
     coords_to_bounds,
     LOCATIONS,
+    SCALE,
 )
 from src.analysis import compare_years, multi_location_summary, INTERPRETATIONS
 
@@ -171,6 +178,11 @@ with col_y1:
 with col_y2:
     current_year = st.number_input("Current Year", 2017, 2025, 2024)
 
+enable_timeseries = st.sidebar.checkbox(
+    "Multi-Year Time Series",
+    help="Fetch data for every year between baseline and current to build trend plots.",
+)
+
 month_range = st.sidebar.slider(
     "Month Window",
     1,
@@ -195,7 +207,7 @@ search_clicked = st.sidebar.button("Search", type="primary", use_container_width
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Data**: Sentinel-2 MSI L2A (GEE)  \n"
-    "**Indices**: SI, NDVI, NDBI  \n"
+    "**Indices**: SI, NDVI, NDBI, NDWI, MNDWI  \n"
     "**Method**: Median composite + pixel-wise differencing"
 )
 
@@ -207,13 +219,19 @@ INDEX_CMAPS = {
     "si": "YlOrRd",
     "ndvi": "RdYlGn",
     "ndbi": "RdBu_r",
+    "ndwi": "Blues",
+    "mndwi": "PuBu",
 }
 
 INDEX_LABELS = {
     "si": "Salinity Index (SI)",
     "ndvi": "Vegetation Index (NDVI)",
     "ndbi": "Built-up Index (NDBI)",
+    "ndwi": "Water Index (NDWI)",
+    "mndwi": "Modified Water Index (MNDWI)",
 }
+
+ALL_INDEX_KEYS = ("si", "ndvi", "ndbi", "ndwi", "mndwi")
 
 
 def _heatmap_fig(arr, title, colorscale, zmin=None, zmax=None):
@@ -276,6 +294,210 @@ def _histogram_fig(delta_arr, index_label):
     return fig
 
 
+def _folium_map(bounds, index_arr, label, colormap="YlOrRd"):
+    """Create a Folium map with an index overlay on the geographic basemap."""
+    center_lat = (bounds[1] + bounds[3]) / 2
+    center_lon = (bounds[0] + bounds[2]) / 2
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=14, tiles="OpenStreetMap")
+
+    # Normalize array to 0-255 for image overlay
+    arr = np.nan_to_num(index_arr, nan=0.0)
+    vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
+    if vmax - vmin > 1e-8:
+        norm = (arr - vmin) / (vmax - vmin)
+    else:
+        norm = np.zeros_like(arr)
+
+    # Create RGBA image using matplotlib colormap
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    cmap_obj = cm.get_cmap(colormap)
+    rgba = cmap_obj(norm)
+    rgba[..., 3] = 0.6  # semi-transparent
+
+    # Convert to uint8
+    img = (rgba * 255).astype(np.uint8)
+
+    # PIL image
+    from PIL import Image
+    pil_img = Image.fromarray(img)
+
+    # Save to bytes
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    import base64
+    encoded = base64.b64encode(buf.read()).decode()
+    img_url = f"data:image/png;base64,{encoded}"
+
+    folium.raster_layers.ImageOverlay(
+        image=img_url,
+        bounds=[[bounds[1], bounds[0]], [bounds[3], bounds[2]]],
+        opacity=0.6,
+        name=label,
+    ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    return m
+
+
+def _compute_area_sq_km(delta_arr, bounds, threshold=0.005):
+    """Compute area in sq km of changed zones from a delta array and bounds."""
+    height_deg = bounds[3] - bounds[1]
+    width_deg = bounds[2] - bounds[0]
+    center_lat = (bounds[1] + bounds[3]) / 2
+
+    height_km = height_deg * 111.32
+    width_km = width_deg * 111.32 * np.cos(np.radians(center_lat))
+    total_area_km2 = height_km * width_km
+
+    total_pixels = delta_arr.size
+    if total_pixels == 0:
+        return {"increased_km2": 0.0, "decreased_km2": 0.0, "total_km2": total_area_km2}
+
+    pixel_area = total_area_km2 / total_pixels
+    increased_px = int(np.sum(delta_arr > threshold))
+    decreased_px = int(np.sum(delta_arr < -threshold))
+
+    return {
+        "increased_km2": round(increased_px * pixel_area, 4),
+        "decreased_km2": round(decreased_px * pixel_area, 4),
+        "total_km2": round(total_area_km2, 4),
+    }
+
+
+def _cross_index_correlation(result):
+    """Compute pairwise Pearson correlation between index delta maps."""
+    keys = [k for k in ALL_INDEX_KEYS if k in result]
+    deltas = {k: result[k]["stats"]["delta_map"].flatten() for k in keys}
+    labels = [INDEX_LABELS[k] for k in keys]
+
+    n = len(keys)
+    corr_matrix = np.zeros((n, n))
+    p_matrix = np.zeros((n, n))
+
+    for i in range(n):
+        for j in range(n):
+            mask = np.isfinite(deltas[keys[i]]) & np.isfinite(deltas[keys[j]])
+            if mask.sum() > 2:
+                r, p = scipy_stats.pearsonr(deltas[keys[i]][mask], deltas[keys[j]][mask])
+                corr_matrix[i, j] = r
+                p_matrix[i, j] = p
+            else:
+                corr_matrix[i, j] = np.nan
+                p_matrix[i, j] = np.nan
+
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_matrix,
+        x=labels,
+        y=labels,
+        colorscale="RdBu_r",
+        zmid=0,
+        zmin=-1,
+        zmax=1,
+        text=np.round(corr_matrix, 3),
+        texttemplate="%{text}",
+        colorbar=dict(title="r"),
+    ))
+    fig.update_layout(
+        title="Cross-Index Correlation (Delta Maps)",
+        height=400,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig, corr_matrix, p_matrix, keys
+
+
+def _generate_pdf_report(loc, result, baseline_year, current_year, bounds=None):
+    """Generate a PDF summary report and return bytes."""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "GeoSpace - Environmental Change Report", ln=True, align="C")
+    pdf.ln(5)
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, f"Location: {loc}", ln=True)
+    pdf.cell(0, 7, f"Baseline Year: {baseline_year}  |  Current Year: {current_year}", ln=True)
+    pdf.cell(0, 7, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+    pdf.ln(5)
+
+    for idx_key in ALL_INDEX_KEYS:
+        if idx_key not in result:
+            continue
+        s = result[idx_key]["stats"]
+        label = INDEX_LABELS[idx_key]
+
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, label, ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"  Mean Baseline: {s['mean_baseline']:.6f}    Mean Current: {s['mean_current']:.6f}", ln=True)
+        pdf.cell(0, 6, f"  Mean Change (Delta I): {s['mean_change']:+.6f}    % Change: {s['pct_change']:+.2f}%", ln=True)
+        pdf.cell(0, 6, f"  RMS Change: {s['rms_change']:.6f}", ln=True)
+        sd = s["spatial_distribution"]
+        pdf.cell(0, 6, f"  Pixels Increased: {sd['positive_frac']*100:.1f}%    Pixels Decreased: {sd['negative_frac']*100:.1f}%", ln=True)
+
+        if bounds:
+            area = _compute_area_sq_km(s["delta_map"], bounds)
+            pdf.cell(0, 6, f"  Area Increased: {area['increased_km2']:.4f} km2    Area Decreased: {area['decreased_km2']:.4f} km2", ln=True)
+
+        pdf.cell(0, 6, f"  Interpretation: {s['interpretation']}", ln=True)
+        pdf.ln(3)
+
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.cell(0, 5, "Data: ESA Copernicus Sentinel-2 L2A | Framework: GeoSpace", ln=True)
+
+    return pdf.output()
+
+
+def _generate_geotiff_bytes(arr, bounds, band_name="index"):
+    """Generate a single-band GeoTIFF in memory and return bytes."""
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    h, w = arr.shape
+    transform = from_bounds(bounds[0], bounds[1], bounds[2], bounds[3], w, h)
+
+    buf = io.BytesIO()
+    with rasterio.open(
+        buf,
+        "w",
+        driver="GTiff",
+        height=h,
+        width=w,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=transform,
+    ) as dst:
+        dst.write(arr.astype(np.float32), 1)
+        dst.set_band_description(1, band_name)
+
+    buf.seek(0)
+    return buf.read()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_fetch(location_name, year, month, month_end, bounds_tuple, gee_project):
+    """Cache GEE fetches so re-runs don't re-download."""
+    bounds = list(bounds_tuple) if bounds_tuple else None
+    gee_ok = init_gee(project=gee_project if gee_project else None)
+    if gee_ok:
+        data = fetch_sentinel_data(
+            location_name=location_name,
+            year=year,
+            month=month,
+            month_end=month_end,
+            bounds=bounds,
+        )
+        if data is not None:
+            return data
+    return generate_synthetic_data(location_name, year)
+
+
 # ---------------------------------------------------------------------------
 # Title
 # ---------------------------------------------------------------------------
@@ -302,49 +524,30 @@ if search_clicked:
         )
 
     all_results = {}
+    timeseries_data = {}  # {loc: {year: {idx_key: mean_value}}}
+    years_list = list(range(baseline_year, current_year + 1)) if enable_timeseries else [baseline_year, current_year]
+
     progress_bar = st.progress(0)
     status_text = st.empty()
-    total_steps = len(selected_locations) * 2
+    total_steps = len(selected_locations) * len(years_list)
     step = 0
 
     for loc in selected_locations:
         loc_bounds = custom_bounds.get(loc)  # None for presets
+        bounds_tuple = tuple(loc_bounds) if loc_bounds else None
+        yearly_data = {}
 
-        # Baseline
-        status_text.text(f"Fetching baseline ({baseline_year}) for {loc}...")
-        if gee_ok:
-            data_b = fetch_sentinel_data(
-                location_name=loc,
-                year=baseline_year,
-                month=month_range[0],
-                month_end=month_range[1],
-                bounds=loc_bounds,
-            )
-        else:
-            data_b = None
-        if data_b is None:
-            data_b = generate_synthetic_data(loc, baseline_year)
-        step += 1
-        progress_bar.progress(step / total_steps)
+        for yr in years_list:
+            status_text.text(f"Fetching {yr} for {loc}...")
+            data = _cached_fetch(loc, yr, month_range[0], month_range[1], bounds_tuple, gee_project)
+            yearly_data[yr] = data
+            step += 1
+            progress_bar.progress(step / total_steps)
 
-        # Current
-        status_text.text(f"Fetching current ({current_year}) for {loc}...")
-        if gee_ok:
-            data_c = fetch_sentinel_data(
-                location_name=loc,
-                year=current_year,
-                month=month_range[0],
-                month_end=month_range[1],
-                bounds=loc_bounds,
-            )
-        else:
-            data_c = None
-        if data_c is None:
-            data_c = generate_synthetic_data(loc, current_year)
-        step += 1
-        progress_bar.progress(step / total_steps)
+        # Baseline vs Current comparison
+        data_b = yearly_data[baseline_year]
+        data_c = yearly_data[current_year]
 
-        # Ensure matching spatial dimensions
         min_h = min(data_b["blue"].shape[0], data_c["blue"].shape[0])
         min_w = min(data_b["blue"].shape[1], data_c["blue"].shape[1])
         for k in ("blue", "green", "red", "nir", "swir"):
@@ -352,6 +555,15 @@ if search_clicked:
             data_c[k] = data_c[k][:min_h, :min_w]
 
         all_results[loc] = compare_years(data_b, data_c)
+
+        # Build time series means for each year
+        if enable_timeseries:
+            from src.indices import compute_all_indices
+            ts = {}
+            for yr, d in yearly_data.items():
+                indices = compute_all_indices(d)
+                ts[yr] = {k: float(np.nanmean(indices[k])) for k in ALL_INDEX_KEYS}
+            timeseries_data[loc] = ts
 
     progress_bar.empty()
     status_text.empty()
@@ -363,6 +575,9 @@ if search_clicked:
     st.session_state["baseline_year"] = baseline_year
     st.session_state["current_year"] = current_year
     st.session_state["month_range"] = month_range
+    st.session_state["custom_bounds"] = custom_bounds
+    st.session_state["timeseries_data"] = timeseries_data
+    st.session_state["enable_timeseries"] = enable_timeseries
 
 # ---------------------------------------------------------------------------
 # Display results (from session state)
@@ -378,6 +593,9 @@ stored_mode = st.session_state["analysis_mode"]
 stored_baseline = st.session_state["baseline_year"]
 stored_current = st.session_state["current_year"]
 stored_months = st.session_state["month_range"]
+stored_bounds = st.session_state.get("custom_bounds", {})
+stored_timeseries = st.session_state.get("timeseries_data", {})
+stored_ts_enabled = st.session_state.get("enable_timeseries", False)
 
 if stored_mode == "Multi-Location Comparison":
     # -----------------------------------------------------------------------
@@ -433,7 +651,7 @@ if stored_mode == "Multi-Location Comparison":
         y="% Change",
         color="Index",
         barmode="group",
-        color_discrete_sequence=["#d9534f", "#5cb85c", "#5bc0de"],
+        color_discrete_sequence=["#d9534f", "#5cb85c", "#5bc0de", "#337ab7", "#9b59b6"],
     )
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.update_layout(height=400, margin=dict(t=30))
@@ -443,7 +661,7 @@ if stored_mode == "Multi-Location Comparison":
     st.subheader("Physics-Based Interpretations")
     for loc in stored_locations:
         with st.expander(f"{loc}", expanded=False):
-            for idx_key in ("si", "ndvi", "ndbi"):
+            for idx_key in ALL_INDEX_KEYS:
                 s = all_results[loc][idx_key]["stats"]
                 st.markdown(
                     f"**{INDEX_LABELS[idx_key]}**: {s['interpretation']}  \n"
@@ -456,36 +674,41 @@ else:
     # -----------------------------------------------------------------------
     loc = stored_locations[0]
     result = all_results[loc]
+    loc_bounds = stored_bounds.get(loc) or LOCATIONS.get(loc)
 
     st.header(f"Analysis: {loc}")
     st.caption(f"Baseline: {stored_baseline} | Current: {stored_current} | Months: {stored_months[0]}-{stored_months[1]}")
 
-    # Top-level metrics
-    cols = st.columns(3)
-    for i, idx_key in enumerate(("si", "ndvi", "ndbi")):
+    # Top-level metrics (all 5 indices)
+    cols = st.columns(5)
+    for i, idx_key in enumerate(ALL_INDEX_KEYS):
         s = result[idx_key]["stats"]
         with cols[i]:
             label = INDEX_LABELS[idx_key]
             delta_str = f"{s['pct_change']:+.2f}%"
+            # SI/NDBI increase is bad; NDVI/NDWI/MNDWI increase is good
             delta_color = "inverse" if idx_key in ("si", "ndbi") else "normal"
             st.metric(label, f"{s['mean_current']:.6f}", delta=delta_str, delta_color=delta_color)
 
     st.markdown("---")
 
     # Tabs per index
-    tabs = st.tabs([INDEX_LABELS[k] for k in ("si", "ndvi", "ndbi")])
+    tabs = st.tabs([INDEX_LABELS[k] for k in ALL_INDEX_KEYS])
 
-    for tab, idx_key in zip(tabs, ("si", "ndvi", "ndbi")):
+    formulas = {
+        "si": "SI = sqrt(Blue x Red)",
+        "ndvi": "NDVI = (NIR - Red) / (NIR + Red)",
+        "ndbi": "NDBI = (SWIR1 - NIR) / (SWIR1 + NIR)",
+        "ndwi": "NDWI = (Green - NIR) / (Green + NIR)",
+        "mndwi": "MNDWI = (Green - SWIR1) / (Green + SWIR1)",
+    }
+
+    for tab, idx_key in zip(tabs, ALL_INDEX_KEYS):
         with tab:
             s = result[idx_key]["stats"]
             cmap = INDEX_CMAPS[idx_key]
             label = INDEX_LABELS[idx_key]
 
-            formulas = {
-                "si": "SI = sqrt(Blue x Red)",
-                "ndvi": "NDVI = (NIR - Red) / (NIR + Red)",
-                "ndbi": "NDBI = (SWIR1 - NIR) / (SWIR1 + NIR)",
-            }
             st.markdown(f"**Formula**: `{formulas[idx_key]}`")
 
             # Row 1: Baseline | Current | Change maps
@@ -541,13 +764,25 @@ else:
                 st.metric("CV Baseline", f"{s['cv_baseline']:.1f}%")
                 st.metric("CV Current", f"{s['cv_current']:.1f}%")
 
-            # Row 3: Histogram
+            # Row 3: Area extent calculations
+            if loc_bounds:
+                st.subheader("Area Extent (sq km)")
+                area = _compute_area_sq_km(s["delta_map"], loc_bounds)
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    st.metric("Total Study Area", f"{area['total_km2']:.4f} km\u00b2")
+                with ac2:
+                    st.metric("Area Increased", f"{area['increased_km2']:.4f} km\u00b2")
+                with ac3:
+                    st.metric("Area Decreased", f"{area['decreased_km2']:.4f} km\u00b2")
+
+            # Row 4: Histogram
             st.plotly_chart(
                 _histogram_fig(s["delta_map"], label),
                 use_container_width=True,
             )
 
-            # Row 4: Interpretation
+            # Row 5: Interpretation
             if s["mean_change"] > 0:
                 icon = "🔴" if idx_key in ("si", "ndbi") else "🟢"
             elif s["mean_change"] < 0:
@@ -557,19 +792,98 @@ else:
             st.info(f"{icon} **Interpretation**: {s['interpretation']}")
 
     # -----------------------------------------------------------------------
+    # Geographic Map Overlay
+    # -----------------------------------------------------------------------
+    if loc_bounds:
+        st.markdown("---")
+        st.header("Geographic Map Overlay")
+        map_idx = st.selectbox(
+            "Select index to overlay on map",
+            ALL_INDEX_KEYS,
+            format_func=lambda k: INDEX_LABELS[k],
+        )
+        map_period = st.radio("Period", ["Current", "Baseline"], horizontal=True)
+        arr_for_map = result[map_idx]["current"] if map_period == "Current" else result[map_idx]["baseline"]
+
+        folium_map = _folium_map(loc_bounds, arr_for_map, INDEX_LABELS[map_idx], INDEX_CMAPS[map_idx])
+        st_folium(folium_map, width=700, height=450)
+
+    # -----------------------------------------------------------------------
+    # Multi-Year Time Series
+    # -----------------------------------------------------------------------
+    if stored_ts_enabled and loc in stored_timeseries:
+        st.markdown("---")
+        st.header("Multi-Year Time Series")
+        ts = stored_timeseries[loc]
+        years = sorted(ts.keys())
+
+        ts_rows = []
+        for yr in years:
+            for idx_key in ALL_INDEX_KEYS:
+                ts_rows.append({
+                    "Year": yr,
+                    "Index": INDEX_LABELS[idx_key],
+                    "Mean Value": ts[yr][idx_key],
+                })
+        ts_df = pd.DataFrame(ts_rows)
+
+        fig_ts = px.line(
+            ts_df,
+            x="Year",
+            y="Mean Value",
+            color="Index",
+            markers=True,
+            color_discrete_sequence=["#d9534f", "#5cb85c", "#5bc0de", "#337ab7", "#9b59b6"],
+        )
+        fig_ts.update_layout(
+            height=450,
+            margin=dict(t=30),
+            xaxis=dict(dtick=1),
+        )
+        st.plotly_chart(fig_ts, use_container_width=True)
+
+        st.caption("Mean index values computed from median composites for each year.")
+
+    # -----------------------------------------------------------------------
+    # Cross-Index Correlation
+    # -----------------------------------------------------------------------
+    st.markdown("---")
+    st.header("Cross-Index Correlation Analysis")
+    corr_fig, corr_matrix, p_matrix, corr_keys = _cross_index_correlation(result)
+    st.plotly_chart(corr_fig, use_container_width=True)
+
+    # Highlight significant correlations
+    sig_pairs = []
+    n_idx = len(corr_keys)
+    for i in range(n_idx):
+        for j in range(i + 1, n_idx):
+            r_val = corr_matrix[i, j]
+            p_val = p_matrix[i, j]
+            if np.isfinite(p_val) and p_val < 0.05 and abs(r_val) > 0.3:
+                sig_pairs.append(
+                    f"**{INDEX_LABELS[corr_keys[i]]}** vs **{INDEX_LABELS[corr_keys[j]]}**: "
+                    f"r = {r_val:.3f} (p = {p_val:.2e})"
+                )
+    if sig_pairs:
+        st.markdown("**Significant correlations** (|r| > 0.3, p < 0.05):")
+        for pair in sig_pairs:
+            st.markdown(f"- {pair}")
+    else:
+        st.markdown("No significant cross-index correlations detected.")
+
+    # -----------------------------------------------------------------------
     # Summary report
     # -----------------------------------------------------------------------
     st.markdown("---")
     st.header("Summary Report")
 
-    summary_cols = st.columns(3)
-    for i, idx_key in enumerate(("si", "ndvi", "ndbi")):
+    summary_cols = st.columns(5)
+    for i, idx_key in enumerate(ALL_INDEX_KEYS):
         s = result[idx_key]["stats"]
         with summary_cols[i]:
             st.subheader(INDEX_LABELS[idx_key])
             if s["mean_change"] > 0:
                 direction = "INCREASED"
-                # SI/NDBI increase is bad (red), NDVI increase is good (green)
                 color = "red" if idx_key in ("si", "ndbi") else "green"
             elif s["mean_change"] < 0:
                 direction = "DECREASED"
@@ -587,48 +901,71 @@ else:
     # Key Findings
     st.subheader("Key Findings")
     findings = []
-    si_s = result["si"]["stats"]
-    ndvi_s = result["ndvi"]["stats"]
-    ndbi_s = result["ndbi"]["stats"]
-
-    if si_s["mean_change"] > 0.005:
-        findings.append(
-            f"Salinity increased by {si_s['pct_change']:+.2f}% - "
-            f"{si_s['interpretation']}"
-        )
-    elif si_s["mean_change"] < -0.005:
-        findings.append(
-            f"Salinity decreased by {abs(si_s['pct_change']):.2f}% - "
-            f"{si_s['interpretation']}"
-        )
-
-    if ndvi_s["mean_change"] > 0.005:
-        findings.append(
-            f"NDVI improved by {ndvi_s['pct_change']:+.2f}% - "
-            f"{ndvi_s['interpretation']}"
-        )
-    elif ndvi_s["mean_change"] < -0.005:
-        findings.append(
-            f"NDVI declined by {abs(ndvi_s['pct_change']):.2f}% - "
-            f"{ndvi_s['interpretation']}"
-        )
-
-    if ndbi_s["mean_change"] > 0.005:
-        findings.append(
-            f"Built-up area expanded by {ndbi_s['pct_change']:+.2f}% - "
-            f"{ndbi_s['interpretation']}"
-        )
-    elif ndbi_s["mean_change"] < -0.005:
-        findings.append(
-            f"Built-up area reduced by {abs(ndbi_s['pct_change']):.2f}% - "
-            f"{ndbi_s['interpretation']}"
-        )
+    for idx_key in ALL_INDEX_KEYS:
+        s = result[idx_key]["stats"]
+        label = INDEX_LABELS[idx_key]
+        if abs(s["mean_change"]) > 0.005:
+            verb = "increased" if s["mean_change"] > 0 else "decreased"
+            findings.append(
+                f"{label} {verb} by {abs(s['pct_change']):.2f}% - {s['interpretation']}"
+            )
 
     if findings:
         for f in findings:
             st.markdown(f"- {f}")
     else:
         st.markdown("All indices remain relatively stable between the two periods.")
+
+    # -----------------------------------------------------------------------
+    # Export Options
+    # -----------------------------------------------------------------------
+    st.markdown("---")
+    st.header("Export")
+    exp_cols = st.columns(3)
+
+    with exp_cols[0]:
+        pdf_bytes = _generate_pdf_report(loc, result, stored_baseline, stored_current, loc_bounds)
+        st.download_button(
+            "Download PDF Report",
+            data=pdf_bytes,
+            file_name=f"geospace_{loc.replace(' ', '_')}_{stored_baseline}_{stored_current}.pdf",
+            mime="application/pdf",
+        )
+
+    with exp_cols[1]:
+        export_idx = st.selectbox("Index for GeoTIFF", ALL_INDEX_KEYS, format_func=lambda k: INDEX_LABELS[k], key="geotiff_idx")
+        if loc_bounds:
+            tiff_bytes = _generate_geotiff_bytes(result[export_idx]["current"], loc_bounds, INDEX_LABELS[export_idx])
+            st.download_button(
+                "Download GeoTIFF (Current)",
+                data=tiff_bytes,
+                file_name=f"{export_idx}_{loc.replace(' ', '_')}_{stored_current}.tif",
+                mime="image/tiff",
+            )
+        else:
+            st.caption("GeoTIFF export requires geographic bounds.")
+
+    with exp_cols[2]:
+        # CSV export of statistics
+        csv_rows = []
+        for idx_key in ALL_INDEX_KEYS:
+            s = result[idx_key]["stats"]
+            csv_rows.append({
+                "Index": INDEX_LABELS[idx_key],
+                "Mean Baseline": s["mean_baseline"],
+                "Mean Current": s["mean_current"],
+                "Mean Change": s["mean_change"],
+                "% Change": s["pct_change"],
+                "RMS Change": s["rms_change"],
+                "Interpretation": s["interpretation"],
+            })
+        csv_df = pd.DataFrame(csv_rows)
+        st.download_button(
+            "Download CSV Statistics",
+            data=csv_df.to_csv(index=False),
+            file_name=f"geospace_stats_{loc.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
 
 st.markdown("---")
 st.caption(

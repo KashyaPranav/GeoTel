@@ -36,6 +36,20 @@ INTERPRETATIONS = {
         "stable": "Built-up extent remains relatively stable",
         "unit": "",
     },
+    "ndwi": {
+        "name": "Water Index (NDWI)",
+        "increase": "Expansion of water bodies or increased surface water presence",
+        "decrease": "Reduction in water coverage, possibly from sedimentation or land reclamation",
+        "stable": "Water body extent remains relatively stable",
+        "unit": "",
+    },
+    "mndwi": {
+        "name": "Modified Water Index (MNDWI)",
+        "increase": "Enhanced water detection, better separation from built-up areas",
+        "decrease": "Reduced water presence or increased land cover over former water areas",
+        "stable": "Modified water index remains relatively stable",
+        "unit": "",
+    },
 }
 
 CHANGE_THRESHOLD = 0.005  # minimum absolute mean change to count as non-stable
@@ -174,7 +188,7 @@ def compare_years(data_baseline, data_current):
     idx_c = compute_all_indices(data_current)
 
     results = {}
-    for key in ("si", "ndvi", "ndbi"):
+    for key in ("si", "ndvi", "ndbi", "ndwi", "mndwi"):
         stats = compute_statistics(idx_b[key], idx_c[key], key)
         results[key] = {
             "baseline": idx_b[key],
@@ -200,7 +214,7 @@ def multi_location_summary(all_results):
     """
     rows = []
     for loc, result in all_results.items():
-        for idx_key in ("si", "ndvi", "ndbi"):
+        for idx_key in ("si", "ndvi", "ndbi", "ndwi", "mndwi"):
             s = result[idx_key]["stats"]
             rows.append(
                 {

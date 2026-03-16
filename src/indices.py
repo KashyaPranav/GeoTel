@@ -6,6 +6,8 @@ reflectance values:
   - Salinity Index (SI)
   - Normalized Difference Vegetation Index (NDVI)
   - Normalized Difference Built-up Index (NDBI) using SWIR1
+  - Normalized Difference Water Index (NDWI)
+  - Modified Normalized Difference Water Index (MNDWI)
 """
 
 import numpy as np
@@ -59,20 +61,53 @@ def ndbi(swir, nir):
     return np.where(denom > EPS, (swir - nir) / denom, 0.0)
 
 
+def ndwi(green, nir):
+    """
+    Compute Normalized Difference Water Index.
+
+    NDWI = (Green - NIR) / (Green + NIR)
+
+    Positive values indicate water bodies. Higher values suggest
+    open water surfaces.
+
+    Reference: McFeeters (1996)
+    Reference bands: B3 (560nm), B8 (842nm)
+    """
+    denom = green + nir
+    return np.where(denom > EPS, (green - nir) / denom, 0.0)
+
+
+def mndwi(green, swir):
+    """
+    Compute Modified Normalized Difference Water Index.
+
+    MNDWI = (Green - SWIR1) / (Green + SWIR1)
+
+    More effective than NDWI at distinguishing water from built-up
+    areas due to SWIR absorption by water.
+
+    Reference: Xu (2006)
+    Reference bands: B3 (560nm), B11 (1610nm)
+    """
+    denom = green + swir
+    return np.where(denom > EPS, (green - swir) / denom, 0.0)
+
+
 def compute_all_indices(band_data):
     """
-    Compute SI, NDVI, and NDBI from a band data dictionary.
+    Compute SI, NDVI, NDBI, NDWI, and MNDWI from a band data dictionary.
 
     Parameters
     ----------
     band_data : dict
-        Must contain 'blue', 'red', 'nir', 'swir' keys with np.ndarray values.
+        Must contain 'blue', 'green', 'red', 'nir', 'swir' keys with np.ndarray values.
 
     Returns
     -------
-    dict with 'si', 'ndvi', 'ndbi' arrays.
+    dict with 'si', 'ndvi', 'ndbi', 'ndwi', 'mndwi' arrays.
     """
     blue = band_data["blue"]
+    green = band_data["green"]
     red = band_data["red"]
     nir = band_data["nir"]
     swir = band_data["swir"]
@@ -81,4 +116,6 @@ def compute_all_indices(band_data):
         "si": salinity_index(blue, red),
         "ndvi": ndvi(nir, red),
         "ndbi": ndbi(swir, nir),
+        "ndwi": ndwi(green, nir),
+        "mndwi": mndwi(green, swir),
     }

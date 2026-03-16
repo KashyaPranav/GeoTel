@@ -8,3 +8,9 @@ earthengine-api
 geemap
 plotly
 geopy
+folium
+streamlit-folium
+rasterio
+fpdf2
+scipy
+pytest
